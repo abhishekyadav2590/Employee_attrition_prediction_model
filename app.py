@@ -21,6 +21,46 @@ MODEL_PATH = "attrition_model.joblib"
 METADATA_PATH = "attrition_model_metadata.json"
 
 
+def normalize_attrition_target(series: pd.Series) -> pd.Series:
+    """Convert common Attrition labels to numeric 1=Yes, 0=No.
+
+    Supports pandas object/string dtypes and numeric 0/1 columns.
+    Unknown labels become NaN so callers can report them clearly.
+    """
+    normalized = series.astype("string").str.strip().str.lower()
+    mapping = {
+        "yes": 1, "no": 0,
+        "1": 1, "0": 0,
+        "true": 1, "false": 0,
+    }
+    return normalized.map(mapping).astype("Float64")
+
+
+def attrition_rate(series: pd.Series) -> float:
+    """Return the share of positive attrition labels, ignoring unknowns."""
+    numeric = normalize_attrition_target(series)
+    if numeric.notna().sum() == 0:
+        raise ValueError("Attrition column has no recognized Yes/No or 1/0 values.")
+    return float(numeric.mean())
+
+
+def positive_probability(model, X) -> tuple[pd.Series, pd.Series]:
+    """Return predictions as 0/1 and probability for the positive class."""
+    classes = list(model.classes_)
+    positive_candidates = [1, True, "1", "yes", "Yes", "YES"]
+    positive_index = next(
+        (i for i, value in enumerate(classes)
+         if value in positive_candidates or str(value).strip().lower() == "yes"),
+        None,
+    )
+    if positive_index is None:
+        raise ValueError(f"Could not identify the positive attrition class in {classes}.")
+    raw_pred = model.predict(X)
+    pred = pd.Series([1 if value == classes[positive_index] else 0 for value in raw_pred])
+    probabilities = model.predict_proba(X)[:, positive_index]
+    return pred, pd.Series(probabilities)
+
+
 @st.cache_resource
 def load_default_model():
     try:
@@ -54,11 +94,19 @@ def train_new_model(df: pd.DataFrame):
 
     df = df.drop_duplicates()
 
-    df[TARGET] = (
-        df[TARGET].map({"Yes": 1, "No": 0})
-        if df[TARGET].dtype == object
-        else df[TARGET]
-    )
+    # Normalize labels regardless of whether pandas loaded the column as
+    # object, string[python], string[pyarrow], or numeric.
+    normalized_target = normalize_attrition_target(df[TARGET])
+    invalid_count = int(normalized_target.isna().sum())
+    if invalid_count:
+        raise ValueError(
+            f"The '{TARGET}' column contains {invalid_count} missing or unsupported labels. "
+            "Use only Yes/No or 1/0 values before training."
+        )
+    df[TARGET] = normalized_target.astype(int)
+
+    if df[TARGET].nunique() != 2:
+        raise ValueError("Training requires both attrition classes (Yes and No).")
 
     X = df.drop(columns=[TARGET])
     y = df[TARGET]
@@ -154,17 +202,16 @@ def predict_df(df, model, metadata):
 
     aligned = df[feature_columns].copy()
 
-    proba = model.predict_proba(aligned)[:, 1]
-    pred = model.predict(aligned)
+    pred, proba = positive_probability(model, aligned)
 
     out = df.copy()
 
     out["Attrition_Prediction"] = [
-        "Yes" if p == 1 else "No"
+        "Yes" if int(p) == 1 else "No"
         for p in pred
     ]
 
-    out["Attrition_Probability"] = proba.round(4)
+    out["Attrition_Probability"] = proba.round(4).to_numpy()
 
     out["Risk_Level"] = pd.cut(
         proba,
@@ -451,11 +498,11 @@ with tab1:
 
             col1, col2, col3, col4 = st.columns(4)
 
-            rate = (
-                (df[TARGET] == "Yes").mean()
-                if df[TARGET].dtype == object
-                else df[TARGET].mean()
-            )
+            try:
+                rate = attrition_rate(df[TARGET])
+            except ValueError as exc:
+                st.error(str(exc))
+                rate = None
 
             col1.metric(
                 "Total Employees",
@@ -464,13 +511,13 @@ with tab1:
 
             col2.metric(
                 "Attrition Rate",
-                f"{rate:.1%}"
+                f"{rate:.1%}" if rate is not None else "N/A"
             )
 
             col3.metric(
                 "Avg Monthly Income",
                 (
-                    f"{df['MonthlyIncome'].mean():,.0f}"
+                    f"{pd.to_numeric(df['MonthlyIncome'], errors='coerce').mean():,.0f}"
                     if "MonthlyIncome" in df
                     else "N/A"
                 )
@@ -479,7 +526,7 @@ with tab1:
             col4.metric(
                 "Avg Years at Company",
                 (
-                    f"{df['YearsAtCompany'].mean():.1f}"
+                    f"{pd.to_numeric(df['YearsAtCompany'], errors='coerce').mean():.1f}"
                     if "YearsAtCompany" in df
                     else "N/A"
                 )
@@ -493,16 +540,12 @@ with tab1:
 
             if "Department" in df.columns:
 
+                rate_data = df[["Department"]].copy()
+                rate_data["_AttritionFlag"] = normalize_attrition_target(df[TARGET])
                 dep = (
-                    df.groupby("Department")[TARGET]
-                    .apply(
-                        lambda s: (
-                            s == "Yes"
-                        ).mean()
-                    )
-                    .reset_index(
-                        name="AttritionRate"
-                    )
+                    rate_data.groupby("Department", dropna=False)["_AttritionFlag"]
+                    .mean()
+                    .reset_index(name="AttritionRate")
                 )
 
                 fig = px.bar(
@@ -519,16 +562,12 @@ with tab1:
 
             if "JobRole" in df.columns:
 
+                rate_data = df[["JobRole"]].copy()
+                rate_data["_AttritionFlag"] = normalize_attrition_target(df[TARGET])
                 role = (
-                    df.groupby("JobRole")[TARGET]
-                    .apply(
-                        lambda s: (
-                            s == "Yes"
-                        ).mean()
-                    )
-                    .reset_index(
-                        name="AttritionRate"
-                    )
+                    rate_data.groupby("JobRole", dropna=False)["_AttritionFlag"]
+                    .mean()
+                    .reset_index(name="AttritionRate")
                 )
 
                 fig = px.bar(
@@ -555,16 +594,12 @@ with tab1:
 
             if "OverTime" in df.columns:
 
+                rate_data = df[["OverTime"]].copy()
+                rate_data["_AttritionFlag"] = normalize_attrition_target(df[TARGET])
                 ot = (
-                    df.groupby("OverTime")[TARGET]
-                    .apply(
-                        lambda s: (
-                            s == "Yes"
-                        ).mean()
-                    )
-                    .reset_index(
-                        name="AttritionRate"
-                    )
+                    rate_data.groupby("OverTime", dropna=False)["_AttritionFlag"]
+                    .mean()
+                    .reset_index(name="AttritionRate")
                 )
 
                 fig = px.bar(
@@ -641,32 +676,19 @@ with tab2:
             "Gradient Boosting)"
         ):
 
-            with st.spinner(
-                "Training and evaluating models..."
-            ):
+            try:
+                with st.spinner("Training and evaluating models..."):
+                    model, metadata, results = train_new_model(df)
 
-                model, metadata, results = (
-                    train_new_model(df)
-                )
+                    st.session_state.model = model
+                    st.session_state.metadata = metadata
 
-                st.session_state.model = model
-                st.session_state.metadata = metadata
-
-                joblib.dump(
-                    model,
-                    MODEL_PATH
-                )
-
-                with open(
-                    METADATA_PATH,
-                    "w"
-                ) as f:
-
-                    json.dump(
-                        metadata,
-                        f,
-                        indent=2
-                    )
+                    joblib.dump(model, MODEL_PATH)
+                    with open(METADATA_PATH, "w", encoding="utf-8") as f:
+                        json.dump(metadata, f, indent=2)
+            except (ValueError, TypeError, KeyError) as exc:
+                st.error(f"Training could not be completed: {exc}")
+                st.stop()
 
             st.success(
                 f"Best model: "
@@ -850,9 +872,12 @@ with tab3:
                             and col in base_df.columns
                         ):
 
-                            default_val = float(
-                                base_df[col].mean()
+                            numeric_values = pd.to_numeric(
+                                base_df[col], errors="coerce"
                             )
+                            default_val = float(numeric_values.mean())
+                            if pd.isna(default_val):
+                                default_val = 0.0
 
                         else:
 
